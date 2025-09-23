@@ -1,31 +1,101 @@
-# This workflow will do a clean installation of node dependencies, cache/restore them, build the source code and run tests across different versions of node
-# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-nodejs
-
-name: Node.js CI
+name: Node.js CI and Zero Downtime Deploy to EC2
 
 on:
   push:
-    branches: [ "main" ]
+    branches:
+      - master
   pull_request:
-    branches: [ "main" ]
+    branches:
+      - master
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
 
     strategy:
       matrix:
-        node-version: [18.x, 20.x, 22.x]
-        # See supported Node.js release schedule at https://nodejs.org/en/about/releases/
+        node-version: [20.x, 22.x]
 
     steps:
-    - uses: actions/checkout@v4
+    - name: Checkout code
+      uses: actions/checkout@v4
+
     - name: Use Node.js ${{ matrix.node-version }}
       uses: actions/setup-node@v4
       with:
         node-version: ${{ matrix.node-version }}
         cache: 'npm'
-    - run: npm ci
+
+    - run: npm install
+
     - run: npm run build --if-present
-    - run: npm test
+
+    - run: echo "No tests defined, skipping..."
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build  # Ensure the build job runs before deployment
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v2
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v3
+      with:
+        node-version: '20'
+
+    - name: Set up SSH
+      uses: webfactory/ssh-agent@v0.5.3
+      with:
+        ssh-private-key: ${{ secrets.SSH_KEY }}
+
+    - name: Clean up target directory on EC2
+      run: |
+        ssh -o StrictHostKeyChecking=no ${{ secrets.SSH_USERNAME }}@${{ secrets.SSH_HOST }} << 'EOF'
+          set -e
+          echo "Cleaning target directory..."
+          find /home/ec2-user/dialog-pay/Vanya-full-app/ ! -name '.env' -type f -exec rm -f {} +
+          find /home/ec2-user/dialog-pay/Vanya-full-app/ ! -name '.env' -type d -empty -delete
+          echo "Target directory cleaned"
+        EOF
+    - name: Copy updated code to EC2
+      run: |
+        rsync -avz -e "ssh -o StrictHostKeyChecking=no" --exclude='.git' . ${{ secrets.SSH_USERNAME }}@${{ secrets.SSH_HOST }}:/home/ec2-user/dialog-pay/Vanya-full-app
+    - name: Deploy `dialog-pay-vanya` container with rolling update
+      run: |
+        ssh -o StrictHostKeyChecking=no ${{ secrets.SSH_USERNAME }}@${{ secrets.SSH_HOST }} << 'EOF'
+          cd /home/ec2-user/dialog-pay/Vanya-full-app
+          # 1. Start the new version of the container with a different name (dialog-pay-vanya-new)
+          docker-compose up -d --build --no-deps dialog-pay-vanya-new
+          # 2. Wait for the new container to become healthy (you can replace this with proper health checks if you have any)
+          echo "Waiting for new container to be ready..."
+          until [ "$(docker inspect -f '{{.State.Health.Status}}' dialog-pay-vanya-new)" == "healthy" ]; do
+            echo "Waiting for new container to become healthy..."
+            sleep 10
+          done
+          # 3. Stop and remove the old container only when the new container is healthy
+          echo "Stopping and removing the old container..."
+          docker container stop dialog-pay-vanya_container
+          docker container rm dialog-pay-vanya_container
+          # 4. Rename the new container to the original name (optional)
+          docker rename dialog-pay-vanya-new dialog-pay-vanya
+          # 5. Confirm the running containers
+          echo "Deployment finished. Running containers:"
+          docker ps --format "table {{.ID}}\t{{.Names}}\t{{.Status}}\t{{.Ports}}"
+        EOF
+    - name: Clean up unused Docker resources on EC2
+      run: |
+        ssh -o StrictHostKeyChecking=no ${{ secrets.SSH_USERNAME }}@${{ secrets.SSH_HOST }} << 'EOF'
+          set -e
+          echo "Cleaning up unused Docker containers, images, and volumes..."
+          # Remove stopped containers
+          docker container prune -f
+          # Remove dangling images (images not associated with any container)
+          docker image prune -f
+          # Remove unused volumes
+          docker volume prune -f
+          # Optionally, prune the system (careful with this one, it removes unused images and volumes, not just dangling ones)
+          # docker system prune -af
+          echo "Docker cleanup finished."
+        EOF
